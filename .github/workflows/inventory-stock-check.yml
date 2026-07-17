@@ -1,0 +1,80 @@
+name: inventory-stock-check
+
+on:
+  schedule:
+    # JST 3:00 / 7:00 / 11:00 / 19:00（メルカリAPIはAzure IPだと約35件で制限されるため40件×4回で全件カバー）
+    - cron: "0 18 * * *"
+    - cron: "0 2 * * *"
+    - cron: "0 10 * * *"
+    - cron: "0 22 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "1にするとLINE送信せずログ出力のみ"
+        required: false
+        default: "0"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: stock-check
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout code (public repo)
+        uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install cryptography
+
+      - name: Set up deploy key for data repo
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.DATA_REPO_DEPLOY_KEY }}
+
+      - name: Clone data repo (private)
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -H github.com >> ~/.ssh/known_hosts 2>/dev/null
+          git clone --depth 1 git@github.com:dragon3399-rising/inventory-stock-check.git data
+
+      - name: Run stock check
+        env:
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+          SHEET_ID_SUB: ${{ secrets.SHEET_ID_SUB }}
+          SHEET_SUB_GID: ${{ secrets.SHEET_SUB_GID }}
+          LINE_CHANNEL_ID: ${{ secrets.LINE_CHANNEL_ID }}
+          LINE_CHANNEL_SECRET: ${{ secrets.LINE_CHANNEL_SECRET }}
+          LINE_USER_ID: ${{ secrets.LINE_USER_ID }}
+          DRY_RUN: ${{ github.event.inputs.dry_run || '0' }}
+          # データセンターIPをbot判定するサイトはローカル巡回に任せる
+          SKIP_HOSTS: "www.amazon.co.jp,item.rakuten.co.jp,biccamera.rakuten.co.jp,www.suruga-ya.jp,store-jp.nintendo.com,www.yodobashi.com"
+          # メルカリAPIは1回の連続実行で約35件が上限（Azure IP）。40件×4回/日のローテーションで全118件をカバー
+          MERCARI_PER_RUN: "40"
+          DATA_DIR: data
+        run: python check_stock.py
+
+      # ローテーション位置(state.json)の永続化 兼 60日無活動での無効化防止ハートビート
+      # データは private データリポジトリ(data/ にクローン済み)側にコミット・プッシュする
+      - name: Save state
+        if: always()
+        working-directory: data
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          date -u +"%Y-%m-%dT%H:%M:%SZ" > heartbeat.txt
+          for f in heartbeat.txt state.json sheet_snapshot.json verify_log.csv verify_log_sub.csv transitions.csv; do
+            [ -f "$f" ] && git add "$f" || true
+          done
+          git commit -m "state update" || exit 0
+          git pull --rebase origin main || true
+          git push
