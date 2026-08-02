@@ -78,3 +78,21 @@ jobs:
           git commit -m "state update" || exit 0
           git pull --rebase origin main || true
           git push
+
+      - name: Notify LINE on failure
+        if: failure()
+        env:
+          LINE_CHANNEL_ID: ${{ secrets.LINE_CHANNEL_ID }}
+          LINE_CHANNEL_SECRET: ${{ secrets.LINE_CHANNEL_SECRET }}
+          LINE_USER_ID: ${{ secrets.LINE_USER_ID }}
+        run: |
+          TOKEN=$(curl -s -X POST https://api.line.me/v2/oauth/accessToken \
+            -H "Content-Type: application/x-www-form-urlencoded" \
+            -d "grant_type=client_credentials&client_id=${LINE_CHANNEL_ID}&client_secret=${LINE_CHANNEL_SECRET}" \
+            | python3 -c "import sys,json; print(json.load(sys.stdin).get('access_token',''))")
+          if [ -n "$TOKEN" ]; then
+            curl -s -X POST https://api.line.me/v2/bot/message/push \
+              -H "Authorization: Bearer ${TOKEN}" \
+              -H "Content-Type: application/json" \
+              -d "{\"to\": \"${LINE_USER_ID}\", \"messages\": [{\"type\": \"text\", \"text\": \"⚠️ 在庫巡回チェックが失敗しました\nRun: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}\"}]}"
+          fi
