@@ -5,7 +5,9 @@
 売り切れ・リンク切れ・判定不能があればLINEに通知する。
 
 環境変数:
-  SHEET_ID            スプレッドシートID
+  SHEET_ID            スプレッドシートID（利益計算表ワークブック）
+  SHEET_ID_SUB        サブ垢シートID
+  MAIN_SOURCE         "rising" で利益計算表RisingJapanタブを本垢ソースとして使用
   LINE_CHANNEL_ID     LINE Messaging APIチャネルID
   LINE_CHANNEL_SECRET LINEチャネルシークレット
   LINE_USER_ID        通知先ユーザーID
@@ -21,13 +23,17 @@ import io
 import json
 import os
 import re
+import signal
+import socket
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 
 from cryptography.hazmat.primitives import hashes
@@ -35,16 +41,42 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
 
 JST = timezone(timedelta(hours=9))
-
-
-def data_path(name: str) -> str:
-    """state.json等のデータファイルのパスを返す。DATA_DIR環境変数で
-    データ用ディレクトリ（別リポジトリのクローン先等）を指定できる。"""
-    return os.path.join(os.environ.get("DATA_DIR", "."), name)
-
-
 UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
+
+# プロセス全体のソケットに強制タイムアウトをかける保険（1段目）。
+socket.setdefaulttimeout(35)
+
+
+class HardTimeout(Exception):
+    pass
+
+
+@contextmanager
+def hard_timeout(seconds: int):
+    """signal.alarmによる真の強制タイムアウト（2段目・本命）。
+    2026-08-02、socket.setdefaulttimeout(35)だけでは不十分と判明——
+    サーバーが極端に遅くデータを送り続ける("slowloris"的な)応答だと、
+    urllibのtimeout引数は個々のread待ち時間しか区切らず、
+    read()呼び出し全体が無期限に伸びてハングし続ける事象を実測。
+    signal.alarmはブロッキング内容を問わずOSレベルで強制的に例外を発生させるため、
+    この種のハングも確実に打ち切れる。
+    【注意】signal.alarmはメインスレッドでしか使えない（他スレッドから呼ぶとValueError）。
+    2026-08-02、ThreadPoolExecutor内のワーカースレッドから呼んで22件同時に
+    ValueError誤判定を出す事故を実測。ワーカースレッドでは何もせず素通りする
+    （その場合はsocket.setdefaulttimeout(35)の1段目のみで守られる）。"""
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    def _on_alarm(signum, frame):
+        raise HardTimeout(f"{seconds}秒のハードタイムアウト")
+    old = signal.signal(signal.SIGALRM, _on_alarm)
+    signal.alarm(seconds)
+    try:
+        yield
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old)
 
 IN_STOCK = "IN_STOCK"
 OUT_OF_STOCK = "OUT_OF_STOCK"
@@ -82,25 +114,94 @@ def fetch_sheet(sheet_id: str) -> tuple[list[dict], dict]:
     return rows, all_status
 
 
+def fetch_sheet_rising(sheet_id: str) -> tuple[list[dict], dict]:
+    """本垢の新ソース: 利益計算表ブックの「RisingJapan」タブ（2026-08-01から使用）。
+    キーワードセル（E列）が赤=end list なので除外し、赤以外×URLありを巡回対象とする。
+    色はCSVでは取れないためxlsxでダウンロードしてopenpyxlで読む。
+    列: C=SKU, D=ItemID, E=キーワード, G=EC site URL, L=仕入価格。"""
+    import openpyxl  # GitHub Actions側は workflow で pip install する
+    import tempfile
+    url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=xlsx"
+    req = urllib.request.Request(url, headers={"User-Agent": UA})
+    with urllib.request.urlopen(req, timeout=120) as res:
+        raw = res.read()
+    with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as f:
+        f.write(raw)
+        path = f.name
+    try:
+        wb = openpyxl.load_workbook(path, read_only=False, data_only=True)
+        ws = wb["RisingJapan"]
+        rows, all_status = [], {}
+        for r in ws.iter_rows(min_row=8):
+            sku = str(r[2].value or "").strip()
+            url_ = str(r[6].value or "").strip()
+            if not sku or not url_.startswith("http"):
+                continue
+            name = str(r[4].value or "").strip().replace("\n", " ")
+            fill = r[4].fill
+            rgb = str(fill.fgColor.rgb) if fill and fill.patternType and fill.fgColor else ""
+            is_red = any(c in rgb for c in ("FF0000", "CC0000", "E06666", "EA4335"))
+            # I列(9列目)= 在庫判定列。「在」「有在庫」=ユーザーが自宅に実物確保→巡回不要・上書き禁止
+            i_val = str(r[8].value or "").strip()
+            is_mine = i_val in ("在", "有在庫")
+            all_status[f"本垢::{url_}"] = {
+                "sku": sku, "name": name,
+                "stock": "赤" if is_red else ("在" if is_mine else "有"),
+            }
+            if not is_red and not is_mine:
+                # TODO: 8月に検証ログを月次ローテーションした後、r[11]の仕入価格で
+                # 本垢も価格±5%監視を有効化する（現状はログ列数の互換性のため見送り）
+                rows.append({"sku": sku, "name": name, "url": url_, "account": "本垢",
+                             "sheet_row": r[0].row, "i_val": i_val})
+        return rows, all_status
+    finally:
+        os.unlink(path)
+
+
 def fetch_sheet_sub(sheet_id: str, gid: str) -> tuple[list[dict], dict]:
     """サブ垢（時計）の利益計算表Sakurarisingタブ。ヘッダーは7行目、
-    列: 2=SKU(wat…), 4=商品名, 6=EC site URL, 8=有無(有/無/消), 11=仕入価格(¥9,500形式)。
-    「有」の行のみ巡回対象。仕入価格は±5%価格監視の基準値。"""
-    rows, all_status = [], {}
-    for r in _fetch_csv(sheet_id, gid)[7:]:
-        if len(r) < 12 or not r[2].strip():
-            continue
-        sku, name, url_, stock = r[2].strip(), r[4].strip(), r[6].strip(), r[8].strip()
-        if not url_.startswith("http"):
-            continue
-        all_status[f"サブ垢::{url_}"] = {"sku": sku, "stock": stock,
-                                        "name": name.replace("\n", " ")}
-        if stock == "有":
-            m = re.search(r"[\d,]+", r[11])
-            reg_price = int(m.group(0).replace(",", "")) if m else None
-            rows.append({"sku": sku, "name": name.replace("\n", " "), "url": url_,
-                         "account": "サブ垢", "reg_price": reg_price})
-    return rows, all_status
+    列: C=SKU(wat…), E=商品名, G=EC site URL, I=有無(有/無/消/在), L=仕入価格。
+    2026-08-07〜: 本垢と同じく「商品名セル(E列)が赤=出品取り下げ済み」を巡回除外の
+    基準にする。加えて2026-08-10〜: 本垢の「在」「有在庫」と同じ意味で、I列が
+    「在」「有在庫」の行（自宅に実物確保済み）も巡回除外にする（wat035で導入）。
+    色はCSVでは取れないためxlsxでダウンロードしてopenpyxlで読む。"""
+    import openpyxl
+    import tempfile
+    url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=xlsx"
+    req = urllib.request.Request(url, headers={"User-Agent": UA})
+    with urllib.request.urlopen(req, timeout=120) as res:
+        raw = res.read()
+    with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as f:
+        f.write(raw)
+        path = f.name
+    try:
+        wb = openpyxl.load_workbook(path, read_only=False, data_only=True)
+        ws = wb["Sakurarising"]
+        rows, all_status = [], {}
+        for r in ws.iter_rows(min_row=8):
+            sku = str(r[2].value or "").strip()
+            url_ = str(r[6].value or "").strip()
+            if not sku or not url_.startswith("http"):
+                continue
+            name = str(r[4].value or "").strip().replace("\n", " ")
+            fill = r[4].fill
+            rgb = str(fill.fgColor.rgb) if fill and fill.patternType and fill.fgColor else ""
+            is_red = any(c in rgb for c in ("FF0000", "CC0000", "E06666", "EA4335"))
+            i_val = str(r[8].value or "").strip()
+            is_mine = i_val in ("在", "有在庫")
+            all_status[f"サブ垢::{url_}"] = {
+                "sku": sku, "name": name,
+                "stock": "赤" if is_red else ("在" if is_mine else "有"),
+            }
+            if not is_red and not is_mine:
+                price_text = str(r[11].value or "")
+                m = re.search(r"[\d,]+", price_text)
+                reg_price = int(m.group(0).replace(",", "")) if m else None
+                rows.append({"sku": sku, "name": name, "url": url_,
+                             "account": "サブ垢", "reg_price": reg_price})
+        return rows, all_status
+    finally:
+        os.unlink(path)
 
 
 # ---------------------------------------------------------------- mercari API
@@ -132,7 +233,7 @@ def _mercari_api_once(item_id: str) -> tuple[str, str, int | None]:
         f"{MERCARI_API}?id={item_id}",
         headers={"DPoP": _mercari_dpop(), "X-Platform": "web",
                  "User-Agent": UA, "Accept": "application/json"})
-    with urllib.request.urlopen(req, timeout=30) as res:
+    with hard_timeout(40), urllib.request.urlopen(req, timeout=30) as res:
         data = json.load(res).get("data", {})
     status = data.get("status", "")
     price = data.get("price") if isinstance(data.get("price"), int) else None
@@ -181,7 +282,7 @@ def fetch_html(url: str, retry: bool = True) -> tuple[int, str]:
         "Accept-Language": "ja,en-US;q=0.7",
     })
     try:
-        with urllib.request.urlopen(req, timeout=30) as res:
+        with hard_timeout(40), urllib.request.urlopen(req, timeout=30) as res:
             raw = res.read()
             charset = res.headers.get_content_charset()
             if not charset:
@@ -269,7 +370,7 @@ def rule_amazon(html: str) -> tuple[str, str] | None:
         return UNKNOWN, "Amazon bot対策ページ"
     # availability div内の「最初の表示文」だけで判定する。
     # ページ全体やdiv周辺1200文字を見ると、おすすめ商品カルーセルの
-    # 「一時的に在庫切れ」等を誤って拾う（過去に誤検知が発生した原因）
+    # 「一時的に在庫切れ」等を誤って拾う（2026-07-13 fis010誤検知の原因）
     m = re.search(r'id="availability"[^>]*>.*?<span[^>]*>\s*([^<]{3,120})', html, re.S)
     if m:
         text = m.group(1).strip()
@@ -315,6 +416,12 @@ def rule_rakuten(html: str) -> tuple[str, str] | None:
         return IN_STOCK, "soldout=0"
     if "'soldout':[1]" in html:
         return OUT_OF_STOCK, "soldout=1"
+    # 新形式ストアフロント（ビックカメラ楽天市場店など）は埋め込みJSONのフラグで判定
+    if '"sold_out_flag":false' in html:
+        m = re.search(r'"inventory":(\d+)', html)
+        return IN_STOCK, f"sold_out_flag=false" + (f"(在庫{m.group(1)})" if m else "")
+    if '"sold_out_flag":true' in html:
+        return OUT_OF_STOCK, "sold_out_flag=true"
     return None
 
 
@@ -375,9 +482,9 @@ def check_generic(url: str) -> tuple[str, str]:
 
     status, html = fetch_html(url)
     if status in (404, 410):
-        # PayPayフリマはデータセンターIPに偽の404を返すことがある
-        # （実際は販売中でもGitHubのIPからは404が返ることがある）→断定せず要確認扱い
-        if host == "paypayfleamarket.yahoo.co.jp":
+        # PayPayフリマ・ヤフオクはデータセンターIPに偽の404を返すことがある
+        # （2026-07-14 hob885、2026-08-07 hob835: 実際は販売中/開催中だった）→断定せず要確認扱い
+        if host in ("paypayfleamarket.yahoo.co.jp", "auctions.yahoo.co.jp"):
             return UNKNOWN, "HTTP 404（bot対策の可能性あり・要手動確認）"
         return LINK_DEAD, f"HTTP {status}"
     if html.startswith("__FETCH_ERROR__"):
@@ -456,53 +563,26 @@ def send_line(text: str) -> None:
         log(f"LINE送信 status={res.status}")
 
 
-def build_daily_digest(all_status: dict) -> str:
-    """直近24時間の検証ログ（GitHub分＋ローカル分、本垢＋サブ垢）を集約した
-    日次レポートを作る。各商品はその24時間内の最新判定を採用する。"""
-    cutoff = datetime.now(JST) - timedelta(hours=24)
-    latest: dict = {}
-    sources = [(VERIFY_LOG, "本垢"),
-               (data_path("verify_log_local.csv"), "本垢"),
-               (VERIFY_LOG_SUB, "サブ垢"),
-               (data_path("verify_log_local_sub.csv"), "サブ垢")]
-    for path, account in sources:
-        if not os.path.exists(path):
-            continue
-        with open(path, newline="") as f:
-            for row in csv.DictReader(f):
-                try:
-                    t = datetime.strptime(row["datetime_jst"], "%Y-%m-%d %H:%M").replace(tzinfo=JST)
-                except (ValueError, TypeError):
-                    continue
-                if t < cutoff:
-                    continue
-                key = (account, row["url"])
-                if key not in latest or latest[key][0] <= t:
-                    latest[key] = (t, row, account)
-
-    def to_item(row: dict, account: str) -> dict:
-        url = row["url"]
-        info = all_status.get(f"{account}::{url}", {})
-        return {"sku": row["sku"], "url": url, "account": account,
-                "name": info.get("name", ""),
-                "site": urllib.parse.urlparse(url).netloc,
-                "reason": row["reason"], "category": row["category"],
-                "price_alert": (row.get("price_alert") or "").strip()}
-
-    results = [to_item(row, account) for _, row, account in latest.values()]
-    sold = [r for r in results if r["category"] == OUT_OF_STOCK]
-    dead = [r for r in results if r["category"] == LINK_DEAD]
-    unknown = [r for r in results if r["category"] == UNKNOWN
+def build_account_digest(account: str, results: list[dict], all_items: list[dict]) -> str | None:
+    """1口座分の日次レポートを作る。対象商品が0件ならNone（送信しない）。
+    all_itemsは赤(除外)以外の全商品(sku/name)。メルカリのローテーション等で
+    直近24時間にログが無い商品もあるため、実際にチェックできた件数(len(acc))とは
+    別に総数を明記し（2026-08-10）、さらにチェック漏れのSKUも列挙する
+    （2026-08-10、「対象と実チェック数の差が何か分からない」という指摘に対応）。"""
+    total = len(all_items)
+    acc = [r for r in results if r["account"] == account]
+    if not acc and total == 0:
+        return None
+    sold = [r for r in acc if r["category"] == OUT_OF_STOCK]
+    dead = [r for r in acc if r["category"] == LINK_DEAD]
+    unknown = [r for r in acc if r["category"] == UNKNOWN
                and r["reason"] != "メルカリAPIレート制限"]
-    rate_limited = [r for r in results if r["reason"] == "メルカリAPIレート制限"]
-    price_alerts = [r for r in results if r["price_alert"] and r["category"] == IN_STOCK]
+    rate_limited = [r for r in acc if r["reason"] == "メルカリAPIレート制限"]
+    price_alerts = [r for r in acc if r["price_alert"] and r["category"] == IN_STOCK]
+    ok = sum(1 for r in acc if r["category"] == IN_STOCK)
 
-    lines = [f"【在庫巡回 日次レポート {datetime.now(JST).strftime('%-m/%-d')}】"]
-    for account in ("本垢", "サブ垢"):
-        acc = [r for r in results if r["account"] == account]
-        if acc:
-            ok = sum(1 for r in acc if r["category"] == IN_STOCK)
-            lines.append(f"{account}: {len(acc)}件チェック（在庫あり{ok}件）")
+    lines = [f"【在庫巡回 日次レポート（{account}） {datetime.now(JST).strftime('%-m/%-d')}】",
+             f"対象{total}件中{len(acc)}件チェック（在庫あり{ok}件）"]
     if not (sold or dead or unknown or price_alerts):
         lines.append("問題は見つかりませんでした。")
 
@@ -533,33 +613,88 @@ def build_daily_digest(all_status: dict) -> str:
                 lines.append(f"  https://www.amazon.co.jp/dp/{m.group(1)}" if m
                              else f"  {r['url'][:250]}")
 
-    for account in ("本垢", "サブ垢"):
-        a_sold = [r for r in sold if r["account"] == account]
-        a_dead = [r for r in dead if r["account"] == account]
-        a_unknown = [r for r in unknown if r["account"] == account]
-        a_price = [r for r in price_alerts if r["account"] == account]
-        if not (a_sold or a_dead or a_unknown or a_price):
-            continue
-        lines.append(f"＜{account}＞")
-        section("売り切れ（シート更新をお願いします）", a_sold, False)
-        section("リンク切れ・出品削除（シート更新をお願いします）", a_dead, True)
-        if a_price:
-            lines.append(f"■価格変動±{PRICE_ALERT_PCT:.0%}以上（仕入価格の見直しを）")
-            for r in a_price:
-                lines.append(f"・{r['sku']} {r['name'][:15]} {r['price_alert']}")
-                lines.append(f"  {r['url'][:250]}")
-        section("判定不能（お手すきに目視確認を）", a_unknown, True)
+    section("売り切れ（シート更新をお願いします）", sold, False)
+    section("リンク切れ・出品削除（シート更新をお願いします）", dead, True)
+    if price_alerts:
+        lines.append(f"■価格変動±{PRICE_ALERT_PCT:.0%}以上（仕入価格の見直しを）")
+        for r in price_alerts:
+            lines.append(f"・{r['sku']} {r['name'][:15]} {r['price_alert']}")
+            lines.append(f"  {r['url'][:250]}")
+    section("判定不能（お手すきに目視確認を）", unknown, True)
     if rate_limited:
         lines.append(f"※メルカリ混雑で{len(rate_limited)}件は未チェック"
                      f"（自動で再確認します・対応不要）: "
                      + ", ".join(sorted(r["sku"] for r in rate_limited)))
+    # 対象件数はあるがログが無い＝直近24時間チェックできていない商品（メルカリ回転制等）。
+    # 「対象◯件中◯件チェック」という表記だけでは差分の中身が分からないとの指摘に対応し、
+    # SKUを列挙する（在庫なし確定ではなく、あくまで「まだ確認できていない」の意）。
+    checked_skus = {r["sku"] for r in acc} | {r["sku"] for r in rate_limited}
+    unchecked = sorted({it["sku"] for it in all_items if it["sku"] not in checked_skus})
+    if unchecked:
+        lines.append(f"※直近24時間チェックできていない{len(unchecked)}件"
+                     f"（在庫なし確定ではありません・次回巡回で確認します）: "
+                     + ", ".join(unchecked))
     lines.append("―――")
-    lines.append("間違いがあればClaudeのチャットにSKUと実際の状態を送ってください（例:「abc123 在庫あり」）")
+    lines.append("間違いがあればClaudeのチャットにSKUと実際の状態を送ってください（例:「hob885 在庫あり」）")
     return "\n".join(lines)
 
 
+def build_daily_digest(all_status: dict) -> list[str]:
+    """直近24時間の検証ログ（GitHub分＋ローカル分、本垢＋サブ垢）を集約し、
+    口座ごとに独立したLINEメッセージのリストを返す（該当商品が0件の口座は含めない）。
+    各商品はその24時間内の最新判定を採用する。"""
+    cutoff = datetime.now(JST) - timedelta(hours=24)
+    latest: dict = {}
+    sources = [(VERIFY_LOG, "本垢"),
+               (os.path.join(BASE_DIR, "verify_log_local.csv"), "本垢"),
+               (VERIFY_LOG_SUB, "サブ垢"),
+               (os.path.join(BASE_DIR, "verify_log_local_sub.csv"), "サブ垢")]
+    for path, account in sources:
+        if not os.path.exists(path):
+            continue
+        with open(path, newline="") as f:
+            for row in csv.DictReader(f):
+                try:
+                    t = datetime.strptime(row["datetime_jst"], "%Y-%m-%d %H:%M").replace(tzinfo=JST)
+                except (ValueError, TypeError):
+                    continue
+                if t < cutoff:
+                    continue
+                key = (account, row["url"])
+                if key not in latest or latest[key][0] <= t:
+                    latest[key] = (t, row, account)
+
+    def to_item(row: dict, account: str) -> dict | None:
+        url = row["url"]
+        info = all_status.get(f"{account}::{url}")
+        # シートからURLが消えた／ユーザーが既に売切等へ更新した行は報告しない
+        # （URL差し替え後に旧URLの判定が24時間残って誤報になるのを防ぐ。2026-07-19 hob465）
+        if info is None or info.get("stock") not in ("在庫有り", "有"):
+            return None
+        return {"sku": row["sku"], "url": url, "account": account,
+                "name": info.get("name", ""),
+                "site": urllib.parse.urlparse(url).netloc,
+                "reason": row["reason"], "category": row["category"],
+                "price_alert": (row.get("price_alert") or "").strip()}
+
+    results = [it for _, row, account in latest.values()
+               if (it := to_item(row, account)) is not None]
+
+    all_items: dict[str, list[dict]] = {"本垢": [], "サブ垢": []}
+    for key, info in all_status.items():
+        account = key.split("::", 1)[0]
+        if account in all_items and info.get("stock") in ("在庫有り", "有"):
+            all_items[account].append({"sku": info["sku"], "name": info.get("name", "")})
+
+    return [msg for account in ("本垢", "サブ垢")
+            if (msg := build_account_digest(account, results, all_items[account])) is not None]
+
+
 # ---------------------------------------------------------------- main
-STATE_PATH = data_path("state.json")
+# DATA_DIRが指定されていればそちら（GitHub Actions側でprivateなdataリポジトリを
+# クローンしたディレクトリ）を、無ければスクリプト自身のディレクトリ（ローカル実行時）を使う。
+BASE_DIR = os.environ.get("DATA_DIR") or os.path.dirname(os.path.abspath(__file__))
+STATE_PATH = os.path.join(BASE_DIR, "state.json")
 # メルカリAPIは1回の実行で約90件以上叩くとレート制限になるため、
 # 1実行あたりの件数を絞り、続きの位置をstate.jsonに記録してローテーションする
 MERCARI_PER_RUN = int(os.environ.get("MERCARI_PER_RUN", "80"))
@@ -579,10 +714,10 @@ def save_state(state: dict) -> None:
 
 
 # ---------------------------------------------------------------- 検証ログ（在庫管理ツール解約判断用）
-VERIFY_LOG = data_path("verify_log.csv")
-VERIFY_LOG_SUB = data_path("verify_log_sub.csv")
-TRANSITIONS_LOG = data_path("transitions.csv")
-SNAPSHOT_PATH = data_path("sheet_snapshot.json")
+VERIFY_LOG = os.path.join(BASE_DIR, "verify_log.csv")
+VERIFY_LOG_SUB = os.path.join(BASE_DIR, "verify_log_sub.csv")
+TRANSITIONS_LOG = os.path.join(BASE_DIR, "transitions.csv")
+SNAPSHOT_PATH = os.path.join(BASE_DIR, "sheet_snapshot.json")
 
 
 def append_verify_log(results: list[dict]) -> None:
@@ -662,10 +797,14 @@ def record_tool_transitions(all_status: dict) -> None:
 
 def main() -> int:
     sheet_id = os.environ["SHEET_ID"]
-    rows, all_status = fetch_sheet(sheet_id)
+    # 本垢のソース: legacy=在庫管理表(〜2026-07-31) / rising=利益計算表RisingJapanタブ(2026-08-01〜)
+    if os.environ.get("MAIN_SOURCE", "legacy") == "rising":
+        rows, all_status = fetch_sheet_rising(os.environ["SHEET_ID_SUB"] or sheet_id)
+    else:
+        rows, all_status = fetch_sheet(sheet_id)
     sub_id = os.environ.get("SHEET_ID_SUB", "").strip()
     if sub_id:
-        sub_rows, sub_status = fetch_sheet_sub(sub_id, os.environ.get("SHEET_SUB_GID", ""))
+        sub_rows, sub_status = fetch_sheet_sub(sub_id, os.environ.get("SHEET_SUB_GID", "1368802580"))
         rows += sub_rows
         all_status.update(sub_status)
         log(f"巡回対象: 本垢{len(rows) - len(sub_rows)}件＋サブ垢{len(sub_rows)}件")
@@ -748,11 +887,18 @@ def main() -> int:
 
     append_verify_log(results)
 
-    # LINE通知は1日1回（その日最初のJST3時以降の実行）に日次レポートとして送る
+    # LINE通知は1日1回、本垢・サブ垢を別メッセージで送る。
+    # 重複防止はlast_digest_date（日付）のみで行う。
+    # 2026-08-02: 以前は「3時以降のみ」という時刻制限もあったが、
+    # 深夜の復旧作業時に手動実行しても送信されない事故の原因になったため撤廃。
     today = datetime.now(JST).strftime("%Y-%m-%d")
-    if state.get("last_digest_date") != today and datetime.now(JST).hour >= 3:
-        msg = build_daily_digest(all_status)
-        send_line(msg)
+    if state.get("last_digest_date") != today:
+        msgs = build_daily_digest(all_status)
+        if not msgs:
+            log("日次レポート: 対象0件のため送信なし")
+        for msg in msgs:
+            send_line(msg)
+            time.sleep(3)  # LINE側で連続送信が1通に見えないよう間隔を空ける
         if os.environ.get("DRY_RUN") != "1":
             state["last_digest_date"] = today
             save_state(state)

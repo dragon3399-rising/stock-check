@@ -34,7 +34,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies
-        run: pip install cryptography
+        run: pip install cryptography openpyxl
 
       - name: Set up deploy key for data repo
         uses: webfactory/ssh-agent@v0.9.0
@@ -52,6 +52,8 @@ jobs:
           SHEET_ID: ${{ secrets.SHEET_ID }}
           SHEET_ID_SUB: ${{ secrets.SHEET_ID_SUB }}
           SHEET_SUB_GID: ${{ secrets.SHEET_SUB_GID }}
+          # 2026-08-01に利益計算表ワークブックのRisingJapanタブへ移行済み（E列赤=出品終了で除外）
+          MAIN_SOURCE: "rising"
           LINE_CHANNEL_ID: ${{ secrets.LINE_CHANNEL_ID }}
           LINE_CHANNEL_SECRET: ${{ secrets.LINE_CHANNEL_SECRET }}
           LINE_USER_ID: ${{ secrets.LINE_USER_ID }}
