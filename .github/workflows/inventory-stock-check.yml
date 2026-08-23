@@ -59,7 +59,7 @@ jobs:
           LINE_USER_ID: ${{ secrets.LINE_USER_ID }}
           DRY_RUN: ${{ github.event.inputs.dry_run || '0' }}
           # データセンターIPをbot判定するサイトはローカル巡回に任せる
-          SKIP_HOSTS: "www.amazon.co.jp,item.rakuten.co.jp,biccamera.rakuten.co.jp,www.suruga-ya.jp,store-jp.nintendo.com,www.yodobashi.com"
+          SKIP_HOSTS: "www.amazon.co.jp,item.rakuten.co.jp,biccamera.rakuten.co.jp,www.suruga-ya.jp,store-jp.nintendo.com,www.yodobashi.com,www.pokemoncenter-online.com"
           # メルカリAPIは1回の連続実行で約35件が上限（Azure IP）。40件×4回/日のローテーションで全118件をカバー
           MERCARI_PER_RUN: "40"
           DATA_DIR: data
